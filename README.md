@@ -15,7 +15,7 @@
 ## 🐛 BUG 处理
 - **订阅 Clash 配置 geosite 补全**：从 GitHub 获取规则集补全 Clash 配置中的 geosite 分流
 - **ALPN 协商随面板设置下发**：h2 / http/1.1 逗号分隔，Clash、Sing-box 与 VLESS/Trojan/XHTTP 节点链接均实际下发
-- **补全GUI.for.SingBox规则集**：使用GUI.for.SingBox客户端请通过导入 sing-box 配置插件进行导入，快速开始导入无法拉起内核
+- **补全GUI.for.SingBox规则集**：使用**GUI.for.SingBox客户端**请通过**导入 sing-box 配置**插件进行导入，**快速开始**下载配置文件会报错导致内核无法拉起
 
 ---
 # 更新日志  _V2.1.0
