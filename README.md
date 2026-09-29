@@ -26,8 +26,6 @@
 ### 🐛 BUG 处理
 1.修复2.0版本下发的配置文件在SingBox客户端无法启动的两处问题，
 - 开启多协议后节点名称出现重复，SingBox客户端配置要求不能出现重复名称，更新重命名协议，Vless→无，Trojian→XX.T，Xhttp→XX.X；
-- SingBox客户端启动时要下载 GeoIP/GeoSite 规则集，testingcf.jsdelivr.net`在国内连不上 → 5 个规则集全部 context deadline exceeded 超时 → 客户端 FATAL 退出。SingBox配置文件回归1.0.6的极简形态；
-
 
 ---
 
