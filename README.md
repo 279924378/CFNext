@@ -32,11 +32,6 @@
 - **订阅 Clash 配置 geosite 补全**：从 GitHub 获取规则集补全 Clash 配置中的 geosite 分流
 - **ALPN 协商随面板设置下发**：h2 / http/1.1 逗号分隔，Clash、Sing-box 与 VLESS/Trojan/XHTTP 节点链接均实际下发
 - **补全GUI.for.SingBox规则集**：使用**GUI.for.SingBox客户端**请通过**导入 sing-box 配置**插件进行导入，**快速开始**下载配置文件会报错导致内核无法拉起
-- **节点提速**根据群友反馈，对下发的节点提速，共修改三处：
-- ① 出站并发竞速（raceConnect 新增 L2070／openOutbound 重写 L2098–2166）
-- ② WS 0-RTT 早数据（uuidToBytes/decodeEarlyData``L2185，handleFirstChunk``L2241）
-- ③ 节点侧下发 ?ed=2048（L2596/L2613/L3211,3237,3259/L3424）
-
 ---
 # 更新日志  _V2.1.0
 
