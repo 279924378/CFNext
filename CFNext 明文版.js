@@ -900,9 +900,11 @@ function hwOvpnToNode(x, cfg) {
   // 端口从 ovpn remote 指令提取（remote <ip> <port>）：VPN Gate CSV 无端口列，此前错位解析取 Ping 值当端口导致全部连不上
   const remoteParts = String(o.remote || '').split(/\s+/);
   const port = parseInt(remoteParts[1], 10) || 443;
-  // 拨号协议以 ovpn 配置为准（proto tcp/udp），缺失时回退面板选择
+  // 拨号协议以 ovpn 配置为准（proto tcp/udp）。ovpn 未声明协议时按 tcp 处理：
+  // 家宽节点一律经 CF 隧道（VLESS-WS）拨号，而 CF Workers 无 UDP 出站能力，
+  // UDP 家宽节点在隧道内必然握手失败，因此「未知协议」只能落到唯一可承载的 tcp 上。
   const ovpnProto = String(o.proto || '').toLowerCase();
-  const proto = (ovpnProto === 'tcp' || ovpnProto === 'udp') ? ovpnProto : 'udp';
+  const proto = ovpnProto === 'udp' ? 'udp' : 'tcp';
   return {
     server: x.ip, port: port, proto, country: x.country,
     ca: o.ca || '', cert: o.cert || '', key: o.key || '',
@@ -938,21 +940,28 @@ async function putHomeWanCache(env, nodes) {
 // 缓存缺失/过期/数量不足（<HW_MIN_COUNT，可能是列表低谷快照）时拉取 VPN Gate 列表按速度取最快 100 台并写缓存（force 强制刷新）
 // 拉取失败/列表为空时回退历史缓存（允许过期）；两者皆无时返回空数组（不抛错——默认/自定义节点照常下发，订阅不会只剩隧道节点）
 const HW_COUNT = 100;   // 家宽节点下发上限（VPN Gate 当日列表有多少发多少，上限 100，按吞吐取最快 N 台）
+// 家宽节点只保留 TCP：CF 隧道（VLESS-WS）不具备 UDP 承载能力（Workers 无 UDP 出站），
+// UDP 家宽节点即使挂上隧道也必然握手失败，下发只会变成一排 Timeout，故在入口统一剔除。
+// 缓存读路径同样过滤——旧缓存里可能还存着协议修正前写入的 UDP 节点。
+function tcpOnlyHomeWan(list) {
+  if (!Array.isArray(list) || !list.length) return list;
+  return list.filter((n) => n && String(n.proto || '').toLowerCase() !== 'udp');
+}
 async function resolveHomeWanNodes(env, cfg, force) {
   if (!cfg.homeWan) return [];
   let cached = null;
-  if (!force) cached = await getHomeWanCache(env);
+  if (!force) cached = tcpOnlyHomeWan(await getHomeWanCache(env));
   // 缓存命中且数量充足（>=30）直接使用；数量过少说明是列表低谷/重建期快照，即使未过期也联网刷新一次（V2.18.0）
   if (cached && cached.length && cached.length >= HW_MIN_COUNT) return cached;
   let nodes = [];
   try {
     const list = await fetchVpnGateList('');
-    nodes = list.slice(0, HW_COUNT).map((x) => hwOvpnToNode(x, cfg));
+    nodes = tcpOnlyHomeWan(list.map((x) => hwOvpnToNode(x, cfg))).slice(0, HW_COUNT);
     if (!nodes.length) nodes = [];
   } catch (e) { /* 拉取失败：回退历史缓存（允许过期），客户端继续用上一份，不会被空配置覆盖 */ }
   if (nodes.length) { await putHomeWanCache(env, nodes); return nodes; }
   if (cached && cached.length) return cached;   // 拉取失败：保留现有缓存（含数量不足的快照）
-  const stale = await getHomeWanCache(env, true);
+  const stale = tcpOnlyHomeWan(await getHomeWanCache(env, true));
   if (stale && stale.length) return stale;
   return [];
 }
@@ -2067,11 +2076,60 @@ async function resolveProxyIPs(host, port) {
   return result;
 }
 
+// ★ 出站并发竞速：同时发起多路连接，取最先握手成功的一路立即返回，后到的成功连接马上关闭。
+// 把原先「串行尝试 + 逐级超时累加」的黑洞时间压到「最快一路的耗时」——尤其目标站在 Cloudflare 上时，
+// 直连会被 Workers 回环保护拦截，过去要白等 6s 才轮到反代；现在反代并发进行，通常 <1s 即可用。
+async function raceConnect(jobs) {
+  if (!jobs || !jobs.length) return null;
+  let settled = false;
+  return await new Promise((resolve) => {
+    let left = jobs.length;
+    const finish = (sock) => {
+      left--;
+      if (sock) {
+        if (settled) { try { sock.close(); } catch (e) { /* 忽略 */ } }   // 败者连接立即释放，避免占用 CF 同时连接配额
+        else { settled = true; resolve(sock); }
+      } else if (left <= 0 && !settled) {
+        resolve(null);
+      }
+    };
+    for (const job of jobs) {
+      Promise.resolve().then(job).then(
+        (s) => finish(s && s.readable ? s : null),
+        () => finish(null)
+      );
+    }
+  });
+}
+
 // 打开到目标的出站连接（含内置地区反代 / 自定义反代透明代理 / 出站代理 / 直连）
 // 所有模式均为透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标
-async function openOutbound(parsed, cfg, colo, isVless) {
+// ★ 提速改造（V2.2.0）：直连类主路径与内置地区反代改为并发竞速，出站方式语义（only/no/默认）保持不变
+const DIRECT_TIMEOUT = 4000;   // 竞速下直连无需久等（反代同时在跑），尽快让快的一路胜出
+const RELAY_TIMEOUT = 4000;    // 内置地区反代单路连接超时
+const MAX_RACERS = 4;          // 单次竞速最多并发路数（CF 单实例同时出站上限 6，留足余量避免自身限流）
+const SNIFF_WAIT_MS = 400;     // 头已完整但暂无数据时，等待首包以判定协议的上限
+
+// ★ 首包协议嗅探（竞速正确性的前提）：
+//   内置地区反代与自定义反代都是 SNI 型透明代理——它们靠读取 TLS ClientHello 里的 SNI 决定转发目标。
+//   因此**只有 TLS 流量能经反代搬运**。非 TLS 流量（Telegram MTProto / 明文 HTTP / 裸 TCP / OpenVPN 等）
+//   没有 SNI：经反代时 TCP 能握手成功（所以"看起来连上了"），但反代找不到目标、一个字节都转发不出去，
+//   客户端表现为连上后绝无响应 → 反复重连（Telegram「无限重连」即此）。
+//   出站改并发竞速后，反代那一跳（就近 CF 边缘，握手几十毫秒）会跑赢跨境直连而被选中，
+//   于是把非 TLS 流量送进了反代——这是「初始版本正常、改后 Telegram 挂掉」的根因。
+//   判定：TLS 记录头固定为 0x16 0x03 xx（ClientHello / handshake），据此分流。
+//     'tls'     → 反代可用：直连 ∥ 反代并发竞速（保持提速收益）
+//     'nontls'  → 只走直连（+ 配置的 SOCKS5/HTTP/SS 出站代理，那类是真代理，可承载任意协议），绝不走 SNI 型反代
+//     'unknown' → 尚未收到首包数据：短暂等待后再判（见 handleFirstChunk），超时仍无数据才按 unknown 放行
+function sniffPayloadKind(bytes) {
+  if (!bytes || bytes.byteLength < 3) return 'unknown';
+  return (bytes[0] === 0x16 && bytes[1] === 0x03) ? 'tls' : 'nontls';
+}
+
+async function openOutbound(parsed, cfg, colo, isVless, payloadKind) {
   const proxy = parseProxyAddress(cfg.outboundProxy);
   const mode = cfg.outboundMode || '';
+  const allowSniRelay = payloadKind !== 'nontls';   // 非 TLS 首包不得走 SNI 型反代（见 sniffPayloadKind）
 
   const viaProxy = proxy ? (proxy.type === 'http' || proxy.type === 'https'
     ? (t) => connectViaHttpProxy(proxy, t)
@@ -2079,66 +2137,63 @@ async function openOutbound(parsed, cfg, colo, isVless) {
       ? (t) => connectViaShadowsocks(proxy, t)
       : (t) => connectViaSocks5(proxy, t)) : null;
 
-  const buildAttempts = (target, timeoutMs) => {
-    const attempts = [];
-    if (mode === 'only') {
-      attempts.push(viaProxy ? () => viaProxy(target) : () => connectDirect(target, timeoutMs));
-    } else if (mode === 'no') {
-      attempts.push(() => connectDirect(target, timeoutMs));
-      if (viaProxy) attempts.push(() => viaProxy(target));
-    } else {
-      if (viaProxy) attempts.push(() => viaProxy(target));
-      attempts.push(() => connectDirect(target, timeoutMs));
-    }
-    return attempts;
-  };
-
   let lastErr;
-  const tryConnect = async (target, timeoutMs) => {
-    for (const fn of buildAttempts(target, timeoutMs)) {
-      try { return await fn(); } catch (e) { lastErr = e; }
-    }
-    return null;
-  };
+  const attempt = async (fn) => { try { const r = await fn(); if (r) return r; } catch (e) { lastErr = e; } return null; };
+  const fail = () => { throw lastErr || new Error('所有出站方式均失败'); };
 
-  // 1) 用户自定义 proxyIP 透明代理：填了「反代/落地 IP」就优先走它作为固定出口，失败再回退直连；
+  // 1) 用户自定义 proxyIP 透明代理：填了「反代/落地 IP」就优先走它作为固定出口，失败再回退；
   //    留空则整块跳过、行为不变。这是"临时切落地"开关：填什么落地=走什么落地，清空=恢复直连。
   const relay = cfg.proxyIP ? parseHostPort(cfg.proxyIP, 443) : null;
-  if (relay && relay.host) {
+  // 非 TLS 首包：SNI 型反代（自定义反代 / 内置地区反代）无法搬运，直接跳过，避免"连上但零字节通过"
+  if (relay && relay.host && allowSniRelay) {
     let customTargets = await resolveProxyIPs(relay.host, relay.port);
     if (!customTargets.length) customTargets = [{ hostname: relay.host, port: relay.port }];
-    for (const target of customTargets) {
-      const r = await tryConnect(target, 6000);
-      if (r) return r;
-    }
+    const r = await raceConnect(customTargets.slice(0, MAX_RACERS).map(t => () => attempt(() => connectDirect(t, RELAY_TIMEOUT))));
+    if (r) return r;
   }
 
-  // 2) 直连目标（非 CF 网站直连可用；CF 网站回环保护会失败）
-  //    6s 连接超时：目标 SYN 被丢弃 / 直连被回环保护拦截时不再无限挂起，及时进入反代兜底
-  const directResult = await tryConnect({ hostname: parsed.addr, port: parsed.port }, 6000);
-  if (directResult) return directResult;
+  const target = { hostname: parsed.addr, port: parsed.port };
 
-  // 3) 兜底内置地区反代（透明代理：发送去掉 VLESS/Trojan 头部的原始 TLS 数据，对端按 SNI 路由到目标）
-  //    多地区轮询：本地区域优先，失败后依次尝试其余区域；单个反代失效不再导致
-  //    （尤其 CF 托管站点直连被回环保护拦截时）流量为 0；VLESS / Trojan / XHTTP 均启用
-  //    （对齐 1.0.6：Trojan 无反代兜底时 Clash Verge 测速 gstatic.com 被回环保护拦截 → 节点全部超时）
-  {
+  // 2) 内置地区反代路径（透明代理）：本地区优先 + 次地区并发；域名解析（DoH，5 分钟缓存）与连接一并放入竞速，
+  //    解析耗时被并发掩盖。每个地区内部再对多个 IP 少量竞速，避免单 IP 抖动拖慢整体。
+  const relayJobs = () => {
+    if (!allowSniRelay) return [];   // 非 TLS：不使用 SNI 型内置地区反代（见 sniffPayloadKind）
     const primary = selectRelayRegion(colo);
-    const regions = [primary, ...Object.keys(RELAY_DOMAINS).filter(r => r !== primary)].slice(0, 3);
-    for (const region of regions) {
+    const regions = [primary, ...Object.keys(RELAY_DOMAINS).filter(r => r !== primary)].slice(0, 2);
+    return regions.map((region, idx) => async () => {
       const relayDomain = RELAY_DOMAINS[region];
-      if (!relayDomain) continue;
-      let relayTargets = [];
-      try { relayTargets = await resolveProxyIPs(relayDomain, 443); } catch (e) { /* 忽略 */ }
-      if (!relayTargets.length) continue;
-      for (const target of relayTargets) {
-        const r = await tryConnect(target, 5000);
-        if (r) return r;
-      }
-    }
+      if (!relayDomain) return null;
+      let ts = [];
+      try { ts = await resolveProxyIPs(relayDomain, 443); } catch (e) { return null; }
+      if (!ts.length) return null;
+      const cand = ts.slice(0, idx === 0 ? 2 : 1);
+      return await raceConnect(cand.map(t => () => attempt(() => connectDirect(t, RELAY_TIMEOUT))));
+    });
+  };
+  const directJob = () => () => attempt(() => connectDirect(target, DIRECT_TIMEOUT));
+  const proxyJob = viaProxy ? () => attempt(() => viaProxy(target)) : null;
+
+  // 仅走代理（only）：代理优先（语义不变），失败才用内置地区反代兜底
+  if (mode === 'only' && proxyJob) {
+    const r = await proxyJob(); if (r) return r;
+    const r2 = await raceConnect(relayJobs().slice(0, MAX_RACERS)); if (r2) return r2;
+    return fail();
   }
 
-  throw lastErr || new Error('所有出站方式均失败');
+  // 默认（优先代理）：代理优先（语义不变），失败后 直连 ∥ 内置地区反代 并发竞速
+  if (mode === '' && proxyJob) {
+    const r = await proxyJob(); if (r) return r;
+    const r2 = await raceConnect([directJob(), ...relayJobs()].slice(0, MAX_RACERS)); if (r2) return r2;
+    return fail();
+  }
+
+  // 直连类主路径（no 模式 / 默认模式未配置出站代理）：直连 ∥ 内置地区反代 并发竞速——
+  // 非 CF 站点直连最快（结果与旧版一致），CF 站点被回环保护时反代立刻接管（不再白等 6s）
+  const r = await raceConnect([directJob(), ...relayJobs()].slice(0, MAX_RACERS));
+  if (r) return r;
+  // no 模式兜底：直连与反代都不通时，最后才用用户配置的出站代理
+  if (proxyJob) { const r2 = await proxyJob(); if (r2) return r2; }
+  return fail();
 }
 
 // 双向管道：socket 可读 → send 回调；结束调用 onDone
@@ -2156,64 +2211,138 @@ async function pumpToReader(reader, send, onDone) {
 // ---------------------------------------------------------------------------
 // WebSocket 代理（VLESS / Trojan）
 // ---------------------------------------------------------------------------
+// ★ WS 0-RTT 早数据（ed=2048）解码：
+//   客户端（xray / v2rayN / mihomo 等）把首个数据包 base64 后放进 WS 握手的 Sec-WebSocket-Protocol 头，
+//   服务端可在握手阶段就取出首包并抢先建立出站，省去「WS 建连完成后再发首帧」的一个往返（约 1 个 RTT），
+//   直接改善首屏/握手敏感型场景（测速、网页首包）。节点侧 path 携带的 ?ed=2048 即为此开关。
+//   安全：只接受能通过协议特征校验的数据（VLESS = version(0)+UUID；Trojan = SHA224 hex+CRLF），
+//   其它取值（例如客户端把 'binary' 当子协议发送）一律返回 null，行为完全回退到无早数据路径，零副作用。
+function uuidToBytes(u) {
+  const h = String(u || '').replace(/-/g, '');
+  if (h.length !== 32) return null;
+  const b = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    const v = parseInt(h.substr(i * 2, 2), 16);
+    if (isNaN(v)) return null;
+    b[i] = v;
+  }
+  return b;
+}
+function decodeEarlyData(header, cfg) {
+  if (!header) return null;
+  const raw = String(header).trim();
+  if (!raw || raw.length > 8192) return null;
+  // 仅允许 base64 / base64url 字符集：随机子协议名（如 binary）解码后无法通过下述协议校验
+  if (!/^[A-Za-z0-9\-_+/=]+$/.test(raw)) return null;
+  let bytes = null;
+  try {
+    const norm = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = norm.length % 4 ? '='.repeat(4 - (norm.length % 4)) : '';
+    const bin = atob(norm + pad);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } catch (e) { return null; }
+  if (!bytes.byteLength || bytes.byteLength > 6144) return null;   // ed 上限 2048~2560，留足余量
+  // VLESS 首包：version(0) + 16 字节二进制 UUID
+  if (bytes.byteLength >= 17 && bytes[0] === 0) {
+    const ub = uuidToBytes(cfg.uuid);
+    if (!ub) return bytes;
+    for (let i = 0; i < 16; i++) if (bytes[i + 1] !== ub[i]) return null;
+    return bytes;
+  }
+  // Trojan 首包：56 字节 SHA224(密码) hex + CRLF（加密仅启用时）
+  if (cfg.enableTrojan && bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a
+      && TD.decode(bytes.subarray(0, 56)).toLowerCase() === trojanPasswordHash(cfg.trojanPassword || cfg.uuid)) {
+    return bytes;
+  }
+  return null;
+}
+
 async function handleWebSocketProxy(request, cfg) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   try { server.accept({ allowHalfOpen: true }); } catch (e) { server.accept(); }
   // 关键：必须声明二进制类型，否则 CF 将二进制帧按 UTF-8 解码成 string，VLESS/Trojan 头（含 16 字节原始 UUID）会被损坏导致隧道失败
   server.binaryType = 'arraybuffer';
-  let socket = null, writer = null, headerSent = false, pending = null;
+  let socket = null, writer = null, headerSent = false, pending = null, protoWait = null;
 
   const send = (data) => { try { server.send(data); } catch (e) { /* 忽略 */ } };
+
+  // ★ 首包处理（WS 数据帧与 0-RTT 早数据共用同一入口；headerSent 在 await 前即置位，
+  //   保证早数据解析期间到达的后续帧走"暂存/直写"分支，不会重复解析首包）
+  const handleFirstChunk = async (chunk, forced) => {
+    // 累积缓冲：Workers 端 WS 消息可能分片到达，不足头部长度时等待后续数据
+    if (chunk && chunk.byteLength) pending = pending ? concatBytes(pending, chunk) : chunk;
+    if (!pending) return;
+    // ★ 握手头缓冲上限（64KB）：正常 VLESS/Trojan 握手头仅数十字节，第二个分片即完成解析并清空缓冲；
+    // 仅当客户端持续发送不完整分片（异常/恶意）时累积，超限断开连接，防内存无限膨胀
+    if (pending.byteLength > 65536) throw new Error('握手头超过 64KB，关闭连接');
+    let parsed, isVless;
+    try {
+      // Trojan 判定：客户端发送 SHA224(密码) 的 56 字节 hex + CRLF；密码与节点生成同源（留空用 UUID）
+      let isTrojan = detectTrojan(pending, cfg);
+      // 分帧等待：部分客户端（mihomo 等）将 Trojan 头分帧发送（首帧可能仅 56 字节 SHA224 hex）。
+      // 此时 pending[0] 为 hex 字符（非 0）且不足 58 字节，不能按 VLESS 解析（会报版本错误而关闭连接），应等待后续分片
+      if (!isTrojan && pending.byteLength > 0 && pending[0] !== 0 && pending.byteLength < 58) return;
+      isVless = !isTrojan;
+      parsed = isTrojan ? parseTrojanHeader(pending) : parseVlessHeader(pending);
+    } catch (err) {
+      if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
+      throw err;
+    }
+    // ★ 首包协议判定：反代是 SNI 型，只有 TLS 流量能经它搬运（详见 sniffPayloadKind）。
+    //   头已完整却暂时没有数据时，先等首包到达再判定出站方式——否则可能把非 TLS 流量（Telegram 等）
+    //   误送进反代。超时（SNIFF_WAIT_MS）仍无数据则按 unknown 放行，不会让连接悬挂。
+    const payload = pending.byteLength > parsed.headerLength ? pending.subarray(parsed.headerLength) : null;
+    const payloadKind = sniffPayloadKind(payload);
+    if (payloadKind === 'unknown' && !forced) {
+      if (!protoWait) protoWait = setTimeout(() => {
+        protoWait = null;
+        handleFirstChunk(new Uint8Array(0), true).catch((e) => { try { server.close(1011, String(e && e.message || e)); } catch (_) { /* 忽略 */ } });
+      }, SNIFF_WAIT_MS);
+      return;   // 等下一帧（或超时后按 unknown 放行）
+    }
+    if (protoWait) { clearTimeout(protoWait); protoWait = null; }
+    headerSent = true;
+    // UDP 请求（command=0x02）：CF Workers 无 UDP socket 无法原生转发数据报，
+    // DNS(53) 查询 → DoH(HTTPS) 转换后回标准 DNS 响应（修复 V2rayNG 关闭「本地 DNS」时远端 DNS 不可用）；
+    // 其余 UDP 快速失败关闭连接（客户端自动回退），TCP（VLESS/Trojan WS/XHTTP）路径零影响
+    if (parsed.command === 2) {
+      try {
+        const payload = pending.subarray(parsed.headerLength);
+        if (parsed.port === 53 && payload.byteLength >= 12) {
+          const resp = await dnsToDoH(payload);
+          if (resp) send(resp);
+        }
+      } catch (e) { /* UDP 处理失败不响应，客户端按超时/回退处理 */ }
+      try { server.close(1000); } catch (e) { /* 忽略 */ }
+      return;
+    }
+    const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, isVless, payloadKind);
+    socket = conn;
+    writer = conn.writable.getWriter();
+    // 透明代理：去掉 VLESS/Trojan 头部，发送原始 TLS 数据，由对端按 SNI 路由
+    // VLESS 协议：须先向客户端回 2 字节响应头（version=0 + addonsLen=0），否则客户端握手失败
+    if (isVless) send(new Uint8Array([0, 0]));
+    // 补发 SOCKS5/HTTP 代理握手残留字节（目标端早期数据），避免 TLS 握手中途被截断
+    if (conn._preamble && conn._preamble.byteLength > 0) send(conn._preamble);
+    if (pending && pending.byteLength > parsed.headerLength) await writer.write(pending.subarray(parsed.headerLength));
+    pending = null;   // 出站就绪后清空缓冲，后续消息直接写出站
+    pumpToReader(conn.readable.getReader(), send, () => { try { server.close(1000); } catch (e) { /* 忽略 */ } });
+  };
+
+  // ★ WS 0-RTT：优先处理 Sec-WebSocket-Protocol 中预发的首包（先于任何 WS 数据帧），
+  //   抢在握手阶段完成出站建连。校验不通过则返回 null，走原始流程。
+  const earlyBytes = decodeEarlyData(request.headers.get('sec-websocket-protocol'), cfg);
+  if (earlyBytes) {
+    handleFirstChunk(earlyBytes).catch((err) => { try { server.close(1011, String(err && err.message || err)); } catch (e) { /* 忽略 */ } });
+  }
 
   server.addEventListener('message', async (ev) => {
     try {
       const chunk = typeof ev.data === 'string' ? TE.encode(ev.data) : new Uint8Array(ev.data);
       if (!headerSent) {
-        // 累积缓冲：Workers 端 WS 消息可能分片到达，不足头部长度时等待后续数据
-        pending = pending ? concatBytes(pending, chunk) : chunk;
-        // ★ 握手头缓冲上限（64KB）：正常 VLESS/Trojan 握手头仅数十字节，第二个分片即完成解析并清空缓冲；
-        // 仅当客户端持续发送不完整分片（异常/恶意）时累积，超限断开连接，防内存无限膨胀
-        if (pending.byteLength > 65536) throw new Error('握手头超过 64KB，关闭连接');
-        let parsed, isVless;
-        try {
-          // Trojan 判定：客户端发送 SHA224(密码) 的 56 字节 hex + CRLF；密码与节点生成同源（留空用 UUID）
-          let isTrojan = detectTrojan(pending, cfg);
-          // 分帧等待：部分客户端（mihomo 等）将 Trojan 头分帧发送（首帧可能仅 56 字节 SHA224 hex）。
-          // 此时 pending[0] 为 hex 字符（非 0）且不足 58 字节，不能按 VLESS 解析（会报版本错误而关闭连接），应等待后续分片
-          if (!isTrojan && pending.byteLength > 0 && pending[0] !== 0 && pending.byteLength < 58) return;
-          isVless = !isTrojan;
-          parsed = isTrojan ? parseTrojanHeader(pending) : parseVlessHeader(pending);
-        } catch (err) {
-          if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
-          throw err;
-        }
-        headerSent = true;
-        // UDP 请求（command=0x02）：CF Workers 无 UDP socket 无法原生转发数据报，
-        // DNS(53) 查询 → DoH(HTTPS) 转换后回标准 DNS 响应（修复 V2rayNG 关闭「本地 DNS」时远端 DNS 不可用）；
-        // 其余 UDP 快速失败关闭连接（客户端自动回退），TCP（VLESS/Trojan WS/XHTTP）路径零影响
-        if (parsed.command === 2) {
-          try {
-            const payload = pending.subarray(parsed.headerLength);
-            if (parsed.port === 53 && payload.byteLength >= 12) {
-              const resp = await dnsToDoH(payload);
-              if (resp) send(resp);
-            }
-          } catch (e) { /* UDP 处理失败不响应，客户端按超时/回退处理 */ }
-          try { server.close(1000); } catch (e) { /* 忽略 */ }
-          return;
-        }
-        const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, isVless);
-        socket = conn;
-        writer = conn.writable.getWriter();
-        // 透明代理：去掉 VLESS/Trojan 头部，发送原始 TLS 数据，由对端按 SNI 路由
-        // VLESS 协议：须先向客户端回 2 字节响应头（version=0 + addonsLen=0），否则客户端握手失败
-        if (isVless) send(new Uint8Array([0, 0]));
-        // 补发 SOCKS5/HTTP 代理握手残留字节（目标端早期数据），避免 TLS 握手中途被截断
-        if (conn._preamble && conn._preamble.byteLength > 0) send(conn._preamble);
-        if (pending && pending.byteLength > parsed.headerLength) await writer.write(pending.subarray(parsed.headerLength));
-        pending = null;   // 出站就绪后清空缓冲，后续消息直接写出站
-        pumpToReader(conn.readable.getReader(), send, () => { try { server.close(1000); } catch (e) { /* 忽略 */ } });
+        await handleFirstChunk(chunk);
       } else {
         // 出站未就绪时暂存，避免头部之后的早期数据帧被丢弃（否则 TLS 握手不完整 → 连接通但流量为 0）
         if (writer) await writer.write(chunk); else pending = pending ? concatBytes(pending, chunk) : chunk;
@@ -2222,7 +2351,10 @@ async function handleWebSocketProxy(request, cfg) {
       try { server.close(1011, String(err && err.message || err)); } catch (e) { /* 忽略 */ }
     }
   });
-  const cleanup = () => { if (socket) { try { socket.close(); } catch (e) { /* 忽略 */ } socket = null; } };
+  const cleanup = () => {
+    if (protoWait) { clearTimeout(protoWait); protoWait = null; }
+    if (socket) { try { socket.close(); } catch (e) { /* 忽略 */ } socket = null; }
+  };
   server.addEventListener('close', cleanup);
   server.addEventListener('error', cleanup);
   return new Response(null, { status: 101, webSocket: client });
@@ -2234,7 +2366,9 @@ async function handleXhttpProxy(request, cfg) {
   const first = await bodyReader.read();
   if (first.done) return new Response('empty', { status: 400 });
   const parsed = parseVlessHeader(first.value);
-  const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, true);
+  // 首包协议判定：非 TLS 流量不得走 SNI 型反代（详见 sniffPayloadKind）
+  const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, true,
+    sniffPayloadKind(first.value.subarray(parsed.headerLength)));
   const writer = conn.writable.getWriter();
   await writer.write(first.value.subarray(parsed.headerLength));
 
@@ -2497,14 +2631,18 @@ function vlessNode(cfg, server, port, name, extra = {}) {
   if (isTls) q += '&security=tls&sni=' + enc(host) + '&fp=chrome';
   else q += '&security=none';   // 80/8080/2052 等明文端口走明文 ws
   q += '&host=' + enc(host);
-  if (extra.type === 'xhttp' && isTls) {
+  const isXhttp = extra.type === 'xhttp' && isTls;
+  if (isXhttp) {
     // XHTTP（stream-one）：仅 TLS 端口生效；必须携带 extra（JSON）作为 XHTTP Extra，否则 V2rayN 无法识别完整 xhttp 配置
     // Padding 头/键由 UUID 内部派生（切片），客户端按此发送，服务端按 VLESS 流处理 body
     q += '&type=xhttp&mode=stream-one';
     q += '&extra=' + enc(JSON.stringify(xhttpPadding(cfg)));
   }
   else q += '&type=ws';   // 明文端口与默认路径均走 ws
-  q += '&path=' + enc('/' + cfg.path);
+  // ★ 0-RTT 提速：TLS 下的 ws 路径携带 ed=2048，客户端（xray/mihomo/v2rayN）会把首包预发进
+  //   Sec-WebSocket-Protocol，服务端握手阶段即取出建连，省掉首个数据帧的往返（约 1 个 RTT）。
+  //   明文端口与 xhttp 不带（前者无益，后者本身即双向流）。服务端解析失败会自动回退，不影响可用性。
+  q += '&path=' + enc('/' + cfg.path + (!isXhttp && isTls ? '?ed=2048' : ''));
   if (cfg.alpn) q += '&alpn=' + cfg.alpn.split(',').map((s) => s.trim().replace(/[&#=]/g, '')).filter(Boolean).join(',');   // ALPN 全裸输出（逗号/斜杠保留：V2rayN 按逗号 split；整串 encodeURIComponent 编码为 %2C%2F 导致解析失败）
   if (cfg.ech) {
     // ECH：输出 "查询域名+DoH"（xray/V2rayN 客户端本地查询 ECH 配置，Worker 端拉取会与用户边缘密钥不匹配导致握手失败）
@@ -2520,9 +2658,11 @@ function trojanNode(cfg, server, port, name) {
   const isTls = !HTTP_PORTS.has(Number(port));
   // 明文端口（80/8080/8880/2052/2082/2086/2095）：走 security=none 明文 ws（不被 TLS 指纹检测，可用性高）；
   // TLS 端口：security=tls + sni/fp
+  // ★ 0-RTT 提速：TLS 下 ws 路径携带 ed=2048（与 VLESS 节点一致，服务端已支持早数据解析）
+  const tjPath = '/' + cfg.path + (isTls ? '?ed=2048' : '');
   let q = isTls
-    ? 'security=tls&sni=' + enc(host) + '&fp=chrome&host=' + enc(host) + '&type=ws&path=' + enc('/' + cfg.path)
-    : 'security=none&host=' + enc(host) + '&type=ws&path=' + enc('/' + cfg.path);
+    ? 'security=tls&sni=' + enc(host) + '&fp=chrome&host=' + enc(host) + '&type=ws&path=' + enc(tjPath)
+    : 'security=none&host=' + enc(host) + '&type=ws&path=' + enc(tjPath);
   if (cfg.alpn && isTls) q += '&alpn=' + cfg.alpn.split(',').map((s) => s.trim().replace(/[&#=]/g, '')).filter(Boolean).join(',');   // ALPN 全裸输出（逗号/斜杠保留：V2rayN 按逗号 split）
   if (cfg.ech && isTls) q += '&ech=' + enc((cfg.echHost || 'cloudflare-ech.com') + '+' + (cfg.echDns || 'https://223.5.5.5/dns-query'));   // ECH：仅 TLS 端口有效
   return `trojan://${cfg.trojanPassword || cfg.uuid}@${addr}:${port}?${q}#${uriFragName(name)}`;
@@ -3117,6 +3257,9 @@ function clashProxyYaml(p) {
 function generateClash(cfg, nodes) {
   const host = cfg.host;
   const path = '/' + cfg.path;
+  // ★ 0-RTT 提速：TLS 下 ws 路径携带 ed=2048（mihomo 识别后启用 early data 首包预发，省 1 个 RTT）；
+  //   不支持的客户端只是把 query 原样带上，服务端按 pathname 路由，行为与旧版完全一致
+  const wsPath = path + '?ed=2048';
   const alpnArr = cfg.alpn ? cfg.alpn.split(',').map((s) => s.trim()).filter(Boolean) : null;   // ALPN 随面板设置下发（V2.10.0），未设置时按协议默认
   const seen = new Set();
   // XHTTP 节点按 mihomo xhttp-opts 规范输出（含 x-padding 混淆参数），与 WS/Trojan 一并下发
@@ -3140,7 +3283,7 @@ function generateClash(cfg, nodes) {
       ...(cfg.ech && tls ? { 'ech-opts': { enable: true, 'query-server-name': cfg.echHost || 'cloudflare-ech.com' } } : {})   // 修复 #6：mihomo ECH 官方格式为顶层 ech-opts（enable + query-server-name），旧 tls-opts.ech 不被识别导致 ECH 未生效
     };
     if (isTrojan) {
-      return { ...base, type: 'trojan', password: user, network: 'ws', 'ws-opts': { path, headers: { Host: host } } };
+      return { ...base, type: 'trojan', password: user, network: 'ws', 'ws-opts': { path: tls ? wsPath : path, headers: { Host: host } } };
     }
     if (xType === 'xhttp') {
       // 从节点链接的 extra 参数恢复 x-padding 混淆配置（由 UUID 派生，与服务端一致）
@@ -3162,7 +3305,7 @@ function generateClash(cfg, nodes) {
         }
       };
     }
-    return { ...base, type: 'vless', uuid: user, network: 'ws', 'ws-opts': { path, headers: { Host: host } } };
+    return { ...base, type: 'vless', uuid: user, network: 'ws', 'ws-opts': { path: tls ? wsPath : path, headers: { Host: host } } };
   });
   // 节点排序：443端口优先（非标准端口如8443在mihomo下HTTPS握手易被GFW干扰，放后面避免默认选中）
   proxies.sort((a, b) => (a.port === 443 ? 0 : 1) - (b.port === 443 ? 0 : 1));
@@ -3322,11 +3465,12 @@ function generateSingbox(cfg, nodes) {
       ? { enabled: true, server_name: host, insecure: true, alpn: alpnArr || ['h2'] }
       : { enabled: true, server_name: host, insecure: true, alpn: alpnArr || ['http/1.1'], utls: { enabled: true, fingerprint: 'chrome' } })
       : { enabled: false };
-    // early data：TLS 下的 ws 走 2048 字节 early data（ed=2048），
-    // 减少首包往返；明文 ws 与 xhttp 不启用
+    // ★ early data 落地（V2.2.0 提速）：TLS 下的 ws 走 ed=2048 + early_data_header_name，
+    // sing-box 会把首包预发进 Sec-WebSocket-Protocol（服务端已支持解析），减少首包往返；
+    // 明文 ws 与 xhttp 不启用（无收益且 xhttp 本身即双向流）
     const transport = type === 'xhttp' ? { type: 'xhttp', mode: 'stream-one', path } :
       (tls ? {
-        type: 'ws', path, headers: { Host: host }
+        type: 'ws', path: path + '?ed=2048', headers: { Host: host }, early_data_header_name: 'Sec-WebSocket-Protocol'
       } : { type: 'ws', path, headers: { Host: host } });
     if (isTrojan) {
       return {
@@ -3675,6 +3819,37 @@ function appendStableNodes(nodes, rc, cap) {
   }
 }
 
+// 家宽模式「隧道前置」节点数（url-test 自动择优切换）
+const TUNNEL_NODE_COUNT = 3;
+// 家宽「隧道前置」专用入口节点（与面板协议开关、筛选条件解耦）
+//
+// 家宽节点（VPN Gate OpenVPN）不是直出节点：它必须由 dialer-proxy 指向「隧道前置」组，
+// 先与 CF Worker 的 WebSocket 入口握手、再由 Worker 边缘替它连到 VPN Gate。
+// 因此「隧道前置」是家宽可用性的唯一硬前置——一旦隧道为空，家宽节点会静默退化成「直连」：
+// 大陆 → VPN Gate 住宅 IP + 随机高位端口（如 1468/1773/1927），被墙拦下即为全部 Timeout。
+//
+// 而隧道节点过去直接取自 buildNodes() 的前几个结果，buildNodes 的每个节点生成都被
+// enableVless / enableTrojan / enableXhttp 守卫（三者全关 → 输出 0 条），也会被地区/ISP 筛选清空。
+// 于是「只想要家宽节点」的用户只要关掉三个协议开关，整条拨号链就会断掉。
+//
+// 故此处单独构造隧道节点：固定 VLESS + WS + TLS(443)，只从内置实测可用的 CF 任播段取，
+// 不依赖网络、优选源与任何面板开关。服务端 WebSocket 入口始终按 VLESS 解析
+// （协议开关只决定「下发哪些节点」，不改变服务端解析路径），固定 VLESS 一定可拨。
+function buildTunnelNodes(rc, count, seed) {
+  const want = count || TUNNEL_NODE_COUNT;
+  const out = Array.isArray(seed) ? seed.slice(0, want) : [];
+  if (out.length >= want) return out;
+  const used = new Set();
+  for (const n of out) { try { used.add(parseNodeServer(n).host); } catch (e) { /* 忽略 */ } }
+  for (const ip of BUILTIN_STABLE_IPS) {
+    if (out.length >= want) break;
+    if (used.has(ip)) continue;
+    used.add(ip);
+    out.push(vlessNode(rc, ip, 443, '隧道前置-' + String(out.length + 1).padStart(2, '0')));
+  }
+  return out;
+}
+
 // 兜底入口节点（代码独立实现）：
 // 兜底入口节点（代码独立实现）：
 // 原生地址（当前访问域名）仅在面板「原生地址」开关（src.native）开启后追加——默认关闭不追加，
@@ -3942,7 +4117,17 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo, env) {
   // 默认模式剔除数量由 fillCount 自动补足（补足路径同样已测活），下发总量保持不变
   // 二次测活移除（对齐 1.0.6）：默认模式不再对优选 IP 池做 TCP 测活剔除——Worker 边缘连通性 ≠ 客户端连通性，
   // 测活误杀导致可用节点少、订阅生成慢；全量下发由客户端自行择优（fillCount 补足块内的小范围测活仍保留）
-  let nodes = hwOnlyMode ? filterNodes(await buildNodes(rc, cap, skipSet), fl).slice(0, 3) : filterNodes(await buildNodes(rc, cap, skipSet), fl);   // 家宽模式：仅保留前 3 个优选节点作 openvpn 拨号隧道（「隧道前置」组自动测活切换），不再下发面板内置节点
+  // 家宽模式：订阅只含「家宽节点 + 隧道前置」，不再下发面板内置节点。
+  // 隧道前置是家宽的硬前置（家宽 openvpn 全部经 dialer-proxy 指向「隧道前置」组拨号），
+  // 所以这里不能直接取 buildNodes 的前 3 条：协议开关全关 / 筛选取空时 buildNodes 无输出，
+  // 隧道会变成空组，家宽节点失去 dialer-proxy 而静默退化为直连（全部 Timeout 的根因）。
+  // 统一交给 buildTunnelNodes 兜底——保留优选结果作隧道候选，不足或为空时用内置 CF 段强制补齐。
+  let nodes;
+  if (hwOnlyMode) {
+    nodes = buildTunnelNodes(rc, TUNNEL_NODE_COUNT, filterNodes(await buildNodes(rc, cap, skipSet), fl).slice(0, TUNNEL_NODE_COUNT));
+  } else {
+    nodes = filterNodes(await buildNodes(rc, cap, skipSet), fl);
+  }
   // 兜底入口节点：自定义订阅严格模式（仅下发框内节点）不追加，其余模式追加原生地址与地区反代入口；
   // 仅勾选 IPv6 时跳过（原生地址/反代均为 IPv4 域名，混入会破坏「只下发 IPv6」语义）
   const strictCustom = (mode === 'custom' && !(cfg.optimizer && cfg.optimizer.subIncludeDefault));
@@ -4399,7 +4584,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
         <div class="card">
           <h3><span class="tick"></span>家宽模式</h3>
           <div class="proto-row"><label class="switch"><input type="checkbox" id="hw-on"><span class="sl"></span></label><span>VPN Gate OpenVPN （仅Mihomo内核）</span></div>
-          <p class="hint">【VPN Gate OpenVPN】自动拉取 VPN Gate 当日列表（按吞吐取最快、上限 100 台）下发为「家宽XX」节点（XX 为地区，同地区自动加序号）；缓存 30 分钟（列表每小时重建/每 5 分钟重排，不足 30 台自动强制刷新，失败回退旧缓存），大陆直连超时由 Worker 边缘代拉；订阅只含家宽节点 + 前 3 优选节点作「隧道前置」拨号（默认/内置 CF 节点不再下发，自定义订阅除外，家宽与自定义节点同步下发）；家宽经「隧道前置」自动测活拨号，隧道自动切换。</p>
+          <p class="hint">【VPN Gate OpenVPN】自动拉取 VPN Gate 当日列表（按吞吐取最快、上限 100 台），只保留 TCP 节点下发为「家宽XX」节点（XX 为地区，同地区自动加序号）——CF 隧道不具备 UDP 承载能力，UDP 家宽节点经隧道必然握手失败，故在入口剔除；缓存 30 分钟（列表每小时重建/每 5 分钟重排，不足 30 台自动强制刷新，失败回退旧缓存）。家宽节点自身不能直连（大陆直连住宅 IP + 随机高位端口必被拦截），一律经「隧道前置」节点拨号；隧道节点由 Worker 自动生成并下发，不占用面板协议开关、也不受地区/运营商筛选影响，隧道自动测活切换。订阅只含家宽节点 + 隧道前置节点（默认/内置 CF 节点不再下发，自定义订阅除外，家宽与自定义节点同步下发）。</p>
         </div>
         <div class="card">
           <h3><span class="tick"></span>TLS 与传输</h3>
@@ -5994,7 +6179,7 @@ async function handleRequest(request, env) {
     if (apiName === 'hwlist') {
       try {
         const country = url.searchParams.get('country') || '';
-        const proto = url.searchParams.get('proto') || 'udp';
+        const proto = url.searchParams.get('proto') || 'tcp';
         const list = await fetchVpnGateList(country);
         if (!list.length) return json({ ok: false, msg: 'VPN Gate 列表为空（可能被限流，请稍后重试）' }, 400);
         const top = list.slice(0, 30);
