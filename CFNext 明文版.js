@@ -19,7 +19,7 @@
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '2.2.0';
+const VERSION = '2.3.0';
 
 // 部署形态标注（手动维护）：明文版部署保持「明文版」；生成混淆版部署前，请将下方标注手动改为「混淆版」。
 // 更新检测时：统一以仓库「CFNext 明文版.js」的版本号为比对基准（明文与混淆同步发布同一版本号），
@@ -538,6 +538,16 @@ const DEFAULT_CONFIG = {
   nodeLimitCount: 500,  // 开启节点数量控制后，最多下发的节点数（默认 500）
   polling: false,       // 轮询机制：开启后每次更新订阅轮询下发新节点（KV issued 去重 + 数量限制），关闭后忽略轮询与限制、下发全部节点
   loadBalance: true,    // 负载均衡：每次订阅请求对下发节点顺序做随机轮换（Fisher-Yates 打乱），分散客户端连接、避免头部节点拥塞变慢；关闭则保持原有固定顺序
+                        //   保底前置：无论负载均衡开关如何，「内置·保底 / 隧道前置」节点始终保留在清单头部并按保底组内部乱序
+                        //   （客户端「取第一个」即稳定可用节点），其余节点整体乱序
+  ipv6Mode: 'off',      // ★ IPv6 下发策略（清单质量）：IPv6 到 CF 的可达性依赖客户端所在网络，不少家庭宽带 v6 到 CF 的路径
+                        //   比 v4 差甚至不通；线上实测 500 条清单里 IPv6 占 230 条（46%），近一半是「备胎」，会显著拖慢
+                        //   客户端的自动择优（逐节点测延迟时被 v6 超时项拖长）。
+                        //   'off'  不下发（默认）：即使「筛选 → IP 类型」勾了 IPv6 也不进清单，生成阶段直接跳过 v6
+                        //          （省 CPU）。仅勾选 IPv6 时例外——策略不该把用户的显式选择变成空订阅
+                        //   'tail' IPv6 仅作备胎：占比封顶（IPV6_MAX_SHARE / IPV6_MAX_ABS）且整体排到列表尾部，v4 打头
+                        //   'full' 旧行为：v4 / v6 等权混合下发
+                        //   注意：本项是运行期策略，KV 中缺失该键时取默认 'off'（线上无需清 KV 即生效），面板可改
   probeAlive: true,     // ★ 节点测活（TCP 探测）总开关：默认开启——恢复 2.0 第四版「下发前剔除死节点」策略，订阅请求对候选地址做 TCP 握手/HTTP 探测、
                         //   剔除判死项后再下发；若首次刷新偏慢（域名预检+测活约 10-40 秒、v2rayNG 可能 30 秒超时），可面板关闭或 PROBE_ALIVE=0 强制关闭。
                         //   节点形态：所有模式统一按 1.0.6 机制——端口原样单端口下发（固定 443、不随机 TLS 端口、不追加明文端口变体）。
@@ -580,7 +590,8 @@ const DEFAULT_CONFIG = {
   // 订阅筛选（按节点名称中的地区/运营商标记 + 地址 IP 类型过滤下发）
   filter: {
     region: 'all',        // 'all' | 'HK' | 'TW' | 'US' | 'SG' | 'JP' | 'KR' | 'DE'
-    ipType: ['IPv4', 'IPv6'],   // 勾选的 IP 类型集合（全选或空 = 不过滤）
+    ipType: ['IPv4'],     // 勾选的 IP 类型集合（全选或空 = 不过滤）；
+                          // 默认仅 IPv4——IPv6 需显式勾选，且仍受 ipv6Mode 策略约束（见上）
     isp: ['移动', '联通', '电信']  // 勾选的运营商集合（全选 = 不过滤）
   }
 };
@@ -2102,13 +2113,54 @@ async function raceConnect(jobs) {
   });
 }
 
+// ★ 直连优先竞速（V2.2.0 修正）：
+//   内置地区反代与自定义反代都是**SNI 型透明代理**——多一跳第三方中转，且对没有 SNI 的流量
+//   （MTProto / 明文 HTTP / 裸 TCP）根本无法搬运。只要目标本身可直连，就没有任何理由绕它。
+//   旧实现「谁先握手成功用谁」有个致命偏向：反代那一跳是"CF 边缘→就近中转机"，
+//   握手普遍比跨境直连快十几到几十毫秒，于是**几乎所有 TLS 流量都被反代抢走**，
+//   表现为：可直连的站点被塞进第三方中转（个别 SNI 还会被误路由，例如维基走反代回到 CF 的 403），
+//   同时把「直连本来更快」的优势整条丢掉。
+//   本函数改为：直连与反代并发发起，但**优先采用直连**——
+//     · 直连在 graceMs 内成功        → 立刻用直连（后到的反代连接直接关闭）
+//     · 直连明确失败 / 窗口到期      → 采用已就绪的反代（反代是并发建的，不额外等待）
+//     · 反代也不可用                  → 继续等直连，不悬挂
+//   graceMs = 0 表示不等直连（用于目标确定在 CF Anycast 段、直连必被回环保护拦截的场景）。
+async function racePreferDirect(directJob, relayJobs, graceMs) {
+  let used = null;
+  const recycle = (s) => { if (s && s !== used) { try { s.close(); } catch (e) { /* 忽略 */ } } };
+
+  const directP = directJob
+    ? Promise.resolve().then(directJob).then((s) => (s && s.readable ? s : null), () => null)
+    : Promise.resolve(null);
+  const relayP = (relayJobs && relayJobs.length)
+    ? raceConnect(relayJobs).then((s) => (s && s.readable ? s : null), () => null)
+    : Promise.resolve(null);
+
+  let graceTimer = null;
+  const first = await Promise.race([
+    directP,
+    new Promise((r) => { graceTimer = setTimeout(() => r('__GRACE__'), graceMs); }),
+  ]);
+  if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+
+  if (first && first !== '__GRACE__') { used = first; relayP.then(recycle); return used; }   // 直连赢
+
+  const relay = await relayP;
+  if (relay) { used = relay; directP.then(recycle); return used; }                            // 反代接管
+
+  const late = await directP;                                                                 // 反代也没有：等直连
+  if (late) { used = late; return used; }
+  return null;
+}
+
 // 打开到目标的出站连接（含内置地区反代 / 自定义反代透明代理 / 出站代理 / 直连）
 // 所有模式均为透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标
 // ★ 提速改造（V2.2.0）：直连类主路径与内置地区反代改为并发竞速，出站方式语义（only/no/默认）保持不变
 const DIRECT_TIMEOUT = 4000;   // 竞速下直连无需久等（反代同时在跑），尽快让快的一路胜出
 const RELAY_TIMEOUT = 4000;    // 内置地区反代单路连接超时
 const MAX_RACERS = 4;          // 单次竞速最多并发路数（CF 单实例同时出站上限 6，留足余量避免自身限流）
-const SNIFF_WAIT_MS = 400;     // 头已完整但暂无数据时，等待首包以判定协议的上限
+const SNIFF_WAIT_MS = 80;      // 头已完整但暂无数据时等首包的极短上限（仅用于协议判定，绝不能拖慢建连）
+const DIRECT_GRACE_MS = 300;   // 直连优先窗口：窗口内直连成功就用直连，避免把可直连目标塞进第三方反代
 
 // ★ 首包协议嗅探（竞速正确性的前提）：
 //   内置地区反代与自定义反代都是 SNI 型透明代理——它们靠读取 TLS ClientHello 里的 SNI 决定转发目标。
@@ -2170,26 +2222,31 @@ async function openOutbound(parsed, cfg, colo, isVless, payloadKind) {
       return await raceConnect(cand.map(t => () => attempt(() => connectDirect(t, RELAY_TIMEOUT))));
     });
   };
-  const directJob = () => () => attempt(() => connectDirect(target, DIRECT_TIMEOUT));
+  const directJob = () => attempt(() => connectDirect(target, DIRECT_TIMEOUT));
   const proxyJob = viaProxy ? () => attempt(() => viaProxy(target)) : null;
+
+  // 目标是 Cloudflare Anycast 段 → Workers 回环保护必然拦截直连，省掉优先窗口，直接上反代；
+  // 其余（含域名形式目标）走直连优先窗口，保住"能直连就不绕中转"的优势
+  const grace = isCloudflareIP(parsed.addr) ? 0 : DIRECT_GRACE_MS;
+  const pickBest = () => racePreferDirect(directJob, relayJobs().slice(0, MAX_RACERS - 1), grace);
 
   // 仅走代理（only）：代理优先（语义不变），失败才用内置地区反代兜底
   if (mode === 'only' && proxyJob) {
     const r = await proxyJob(); if (r) return r;
-    const r2 = await raceConnect(relayJobs().slice(0, MAX_RACERS)); if (r2) return r2;
+    const r2 = await racePreferDirect(null, relayJobs().slice(0, MAX_RACERS), 0); if (r2) return r2;
     return fail();
   }
 
-  // 默认（优先代理）：代理优先（语义不变），失败后 直连 ∥ 内置地区反代 并发竞速
+  // 默认（优先代理）：代理优先（语义不变），失败后 直连优先 ∥ 内置地区反代
   if (mode === '' && proxyJob) {
     const r = await proxyJob(); if (r) return r;
-    const r2 = await raceConnect([directJob(), ...relayJobs()].slice(0, MAX_RACERS)); if (r2) return r2;
+    const r2 = await pickBest(); if (r2) return r2;
     return fail();
   }
 
-  // 直连类主路径（no 模式 / 默认模式未配置出站代理）：直连 ∥ 内置地区反代 并发竞速——
-  // 非 CF 站点直连最快（结果与旧版一致），CF 站点被回环保护时反代立刻接管（不再白等 6s）
-  const r = await raceConnect([directJob(), ...relayJobs()].slice(0, MAX_RACERS));
+  // 直连类主路径（no 模式 / 默认模式未配置出站代理）：直连优先 ∥ 内置地区反代——
+  // 可直连的目标仍旧直连（不绕第三方中转），CF 目标被回环保护时反代接管（不再白等 6s）
+  const r = await pickBest();
   if (r) return r;
   // no 模式兜底：直连与反代都不通时，最后才用用户配置的出站代理
   if (proxyJob) { const r2 = await proxyJob(); if (r2) return r2; }
@@ -2264,7 +2321,7 @@ async function handleWebSocketProxy(request, cfg) {
   try { server.accept({ allowHalfOpen: true }); } catch (e) { server.accept(); }
   // 关键：必须声明二进制类型，否则 CF 将二进制帧按 UTF-8 解码成 string，VLESS/Trojan 头（含 16 字节原始 UUID）会被损坏导致隧道失败
   server.binaryType = 'arraybuffer';
-  let socket = null, writer = null, headerSent = false, pending = null, protoWait = null;
+  let socket = null, writer = null, headerSent = false, pending = null, protoWait = null, respSent = false;
 
   const send = (data) => { try { server.send(data); } catch (e) { /* 忽略 */ } };
 
@@ -2290,6 +2347,10 @@ async function handleWebSocketProxy(request, cfg) {
       if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
       throw err;
     }
+    // ★ 解析成功就立刻下发 VLESS 响应头（version=0 + addonsLen=0），**早于协议嗅探与出站建连**。
+    //   部分客户端（mihomo 等）会等到这 2 字节才开始发首个数据包；越早回 → 越早拿到首包 →
+    //   越早完成协议判定与建连。放在嗅探之后回落 80ms，放在这里则等待归零。
+    if (!respSent && isVless && parsed.command !== 2) { respSent = true; send(new Uint8Array([0, 0])); }
     // ★ 首包协议判定：反代是 SNI 型，只有 TLS 流量能经它搬运（详见 sniffPayloadKind）。
     //   头已完整却暂时没有数据时，先等首包到达再判定出站方式——否则可能把非 TLS 流量（Telegram 等）
     //   误送进反代。超时（SNIFF_WAIT_MS）仍无数据则按 unknown 放行，不会让连接悬挂。
@@ -2303,6 +2364,7 @@ async function handleWebSocketProxy(request, cfg) {
       return;   // 等下一帧（或超时后按 unknown 放行）
     }
     if (protoWait) { clearTimeout(protoWait); protoWait = null; }
+    if (headerSent) return;   // 并发重入保护：早数据与首个数据帧同时到达时只解析一次
     headerSent = true;
     // UDP 请求（command=0x02）：CF Workers 无 UDP socket 无法原生转发数据报，
     // DNS(53) 查询 → DoH(HTTPS) 转换后回标准 DNS 响应（修复 V2rayNG 关闭「本地 DNS」时远端 DNS 不可用）；
@@ -2322,8 +2384,7 @@ async function handleWebSocketProxy(request, cfg) {
     socket = conn;
     writer = conn.writable.getWriter();
     // 透明代理：去掉 VLESS/Trojan 头部，发送原始 TLS 数据，由对端按 SNI 路由
-    // VLESS 协议：须先向客户端回 2 字节响应头（version=0 + addonsLen=0），否则客户端握手失败
-    if (isVless) send(new Uint8Array([0, 0]));
+    // （VLESS 的 2 字节响应头已在本函数开头提前下发，此处不再重复发送，否则客户端会多收一帧脏数据）
     // 补发 SOCKS5/HTTP 代理握手残留字节（目标端早期数据），避免 TLS 握手中途被截断
     if (conn._preamble && conn._preamble.byteLength > 0) send(conn._preamble);
     if (pending && pending.byteLength > parsed.headerLength) await writer.write(pending.subarray(parsed.headerLength));
@@ -2928,9 +2989,10 @@ async function buildNodes(cfg, cap = 800, skipSet = null) {
   // 订阅模式：random 随机优选（CF CIDR 随机生成指定数量，不经域名解析）
   const mode = (cfg.optimizer && cfg.optimizer.subMode) || '';
   // 筛选含 IPv6 时随机生成/补足混合 v4+v6 段；仅勾选 IPv6 时全走官方 v6 网段（ips-v6 拉取，实测可用）
+  // v6Wanted=false（未勾选，或勾了但 ipv6Mode='off'）时只走 v4 段，不生成注定被剔除的 v6 节点
   const ipT = (cfg.filter && cfg.filter.ipType) || [];
-  const wantV6 = ipT.includes('IPv6');
   const onlyV6 = ipT.length === 1 && ipT[0] === 'IPv6';
+  const wantV6 = v6Wanted(cfg);
   const RAND_CIDRS = onlyV6 ? OFFICIAL_V6_CIDRS : (wantV6 ? [...REACHABLE_CIDRS, ...OFFICIAL_V6_CIDRS] : REACHABLE_CIDRS);
   // 仅自定义模式（custom + 关闭追加）：严格按「优选节点」输入框内容下发，放行非 CF 段 IP（用户自担可用性）；
   // 其它模式（默认/追加/随机）入口必须是 CF 段——非 CF IP 无法转发到 Worker（历史 v2rayNG 全 -1 根因）
@@ -3172,6 +3234,112 @@ function filterNodes(nodes, filter) {
   if (!out.length) out = apply(region, FILTER_IPTYPES, FILTER_ISPS);  // 放宽 ipType
   if (!out.length) out = apply('all', FILTER_IPTYPES, FILTER_ISPS);   // 放宽 region
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// 清单质量策略（下发前的两道闸）
+//
+// 背景：客户端测出来的「节点速度」里，真正的大头是「客户端 → CF 边缘」这一段，由节点清单质量决定。
+// 清单里的两个结构性问题会稳定拖慢体感，且都是「下发策略」层面就能修掉的：
+//   ① IPv6 备胎占近一半 —— 客户端逐节点测延迟时被大量 v6 超时项拖长，且择到的最优未必优于 v4；
+//   ② 内置保底节点排在末尾 —— 保底节点是追加在列表尾部的，而紧随其后的封顶截断按顺序砍尾巴，
+//      清单拉满到上限时被砍掉的恰恰是这批最稳的节点；即使没被砍，全量乱序也让它们混在随机快照里，
+//      客户端「取第一个」取不到它。
+// 下面两组函数分别处理这两件事，均在 generateSubscription 内、封顶截断之前调用。
+// ---------------------------------------------------------------------------
+
+// 判断节点 server 是否为字面 IPv6 地址（带方括号的 URI 形式也算；域名节点不算——
+// 域名节点由客户端自行解析，落 v4/v6 取决于客户端网络，不参与本策略）
+function isV6Node(n) {
+  try {
+    let host = parseNodeServer(n).host || '';
+    if (host.charAt(0) === '[') host = host.slice(1, host.indexOf(']') > 0 ? host.indexOf(']') : undefined);
+    return host.indexOf(':') >= 0;
+  } catch (e) { return false; }
+}
+
+// IPv6 是否参与「生成」：勾选 IPv6 且策略不是 'off'。
+// 'off' 时生成阶段直接不产出 v6（省一次 v6 CIDR 拉取与 AAAA 解析的 CPU）；
+// 仅勾选 IPv6（单选）时无论如何都要生成，否则订阅必空。
+function v6Wanted(cfg) {
+  const t = (cfg && cfg.filter && cfg.filter.ipType) || [];
+  if (!t.includes('IPv6')) return false;
+  if (t.length === 1) return true;
+  const m = (cfg && cfg.ipv6Mode) || 'off';
+  return m === 'tail' || m === 'full';
+}
+
+// IPv6 备胎占比上限（ipv6Mode='tail' 生效）：最多占清单的这个比例，且绝对条数不超过 IPV6_MAX_ABS
+const IPV6_MAX_SHARE = 0.1;
+const IPV6_MAX_ABS = 40;
+
+// IPv6 下发策略闸门：
+//   'off'  剔除 v6 节点；剔除后为空则原样保留（订阅永不为空，避免客户端「无效订阅」）
+//   'tail' v6 占比封顶后整体后移，v4 打头
+//   'full' 原样返回
+// 仅勾选 IPv6（onlyV6）时一律原样返回——策略不该把用户的显式选择变成空订阅
+function applyIpv6Policy(nodes, cfg, onlyV6) {
+  const mode = (cfg && cfg.ipv6Mode) || 'off';
+  if (onlyV6 || mode === 'full' || mode === 'mix' || nodes.length < 2) return nodes;
+  const v6 = [], v4 = [];
+  for (const n of nodes) (isV6Node(n) ? v6 : v4).push(n);
+  if (!v6.length) return nodes;
+  if (mode === 'off') return v4.length ? v4 : nodes;
+  const keep = Math.max(1, Math.min(v6.length, IPV6_MAX_ABS, Math.floor(v4.length * IPV6_MAX_SHARE)));
+  return v4.length ? v4.concat(v6.slice(0, keep)) : nodes;
+}
+
+// 「保底节点」识别（按节点名前缀；多协议时名字带 .T/.X 后缀，故用前缀匹配不用全等）：
+//   · 优选IP-Sxx —— 生成阶段把 BUILTIN_STABLE_IPS 20 条实测高存活 IP 插到优选池最前（见 generateSubscription），
+//                    客户端「取第一个」原本就该取到它们，但全量乱序把这条优势抹掉了；
+//   · 内置·保底-XX —— BUILTIN_STABLE_IPS 的显式保底节点（追加在列表尾部，最易被封顶截断砍掉）；
+//   · 隧道前置-XX —— 家宽 dialer-proxy 的硬前置，同样必须留在头部。
+const STABLE_NAME_RE = /^(?:优选IP-S\d|内置·保底-|隧道前置-)/;
+function isStableNode(n) {
+  try {
+    const h = n.indexOf('#');
+    if (h < 0) return false;
+    return STABLE_NAME_RE.test(decodeURIComponent(n.slice(h + 1) || ''));
+  } catch (e) { return false; }
+}
+
+// 原地 Fisher-Yates 洗牌（仅打乱顺序，不改动节点集合）
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// 下发顺序策略：保底前置 + 分组乱序。
+//   · 保底组（优选IP-Sxx / 内置·保底 / 隧道前置）提到数组头部 —— 必须早于「封顶截断」执行，
+//     这样截断砍掉的是尾部节点，保底节点不会再被 cap 挤掉；
+//   · 保底组内部乱序：第一发不总是同一个 IP（保留负载均衡收益），但一定落在稳定 IP 上；
+//   · 其余节点全量乱序（沿用原负载均衡语义）；
+//   · IPv6 备胎（ipv6Mode='tail'）不参与乱序，整体留在清单最末 —— 否则负载均衡会把 v6 又混回中部，
+//     既破坏了「v6 排尾部」的语义，也让封顶截断变得可能砍掉 v4 而不是备胎；
+//   · 保底组为空时退化为原行为（全量乱序）；loadBalance=false 时保持既有固定顺序（只做保底前置）。
+function reorderForDelivery(nodes, cfg, mode) {
+  if (nodes.length < 2) return nodes;
+  const lb = cfg.loadBalance !== false && mode !== 'random';
+  const deferV6 = (cfg && cfg.ipv6Mode) === 'tail';
+  const stable = [], rest = [], tailV6 = [];
+  for (const n of nodes) {
+    if (isStableNode(n)) stable.push(n);
+    else if (deferV6 && isV6Node(n)) tailV6.push(n);
+    else rest.push(n);
+  }
+  if (!stable.length && !tailV6.length) {
+    if (lb) shuffleInPlace(nodes);
+    return nodes;
+  }
+  if (lb) { shuffleInPlace(stable); shuffleInPlace(rest); }
+  nodes.length = 0;
+  for (let i = 0; i < stable.length; i++) nodes.push(stable[i]);
+  for (let i = 0; i < rest.length; i++) nodes.push(rest[i]);
+  for (let i = 0; i < tailV6.length; i++) nodes.push(tailV6[i]);
+  return nodes;
 }
 
 // ---------- Clash YAML ----------
@@ -3797,24 +3965,31 @@ async function fetchBestcfPool() {
 
 // 内置保底节点：CF 官方任播段 IP（实测 443 全部可达），固定 443 追加下发，
 // 无论任何订阅模式都保证订阅内存在稳定可用节点
-function appendStableNodes(nodes, rc, cap) {
-  if (nodes.length >= cap) return;
+//
+// force=true：即使当前节点数已达 cap 也继续追加（内部上限放宽为「现有条数 + 保底池×3」）。
+// 这是「保底前置」的前提——追加后由 reorderForDelivery 把保底组提到头部、再按 cap 截断，
+// 净效果是保底节点一定在清单里、被挤掉的是尾部随机节点；旧逻辑「已达上限直接 return」
+// 会在清单拉满（nodeLimitCount 精确控制到 500）时让 20 条保底节点全部缺席。
+function appendStableNodes(nodes, rc, cap, force) {
+  if (!force && nodes.length >= cap) return;
+  // 保底池每个 IP 最多生成 3 条（vless/trojan/xhttp），留足空间
+  const limit = force ? nodes.length + BUILTIN_STABLE_IPS.length * 3 : cap;
   const used = new Set();
   for (const n of nodes) {
     try { used.add(parseNodeServer(n).host); } catch (e) { /* 忽略 */ }
   }
   let si = 0;
   for (const ip of BUILTIN_STABLE_IPS) {
-    if (nodes.length >= cap) break;
+    if (nodes.length >= limit) break;
     if (used.has(ip)) continue;
     used.add(ip);
     si++;
     const baseNm = '内置·保底-' + String(si).padStart(2, '0');
     const nmP = protoNames(baseNm, !!rc.enableVless, !!rc.enableTrojan, !!rc.enableXhttp);
     if (rc.enableVless) nodes.push(vlessNode(rc, ip, 443, nmP.v));
-    if (nodes.length >= cap) break;
+    if (nodes.length >= limit) break;
     if (rc.enableTrojan) nodes.push(trojanNode(rc, ip, 443, nmP.t));
-    if (nodes.length >= cap) break;
+    if (nodes.length >= limit) break;
     if (rc.enableXhttp) nodes.push(vlessNode(rc, ip, 443, nmP.x, { type: 'xhttp' }));
   }
 }
@@ -3883,8 +4058,9 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo, env) {
   // 兜底：path 为空或为 "/" 时一律回退 UUID（兼容 KV 残留旧值；Worker WS/xhttp 代理仅在 panelPath=cfg.path 处理）
   if (!cfg.path || cfg.path === '/' || cfg.path === '') cfg.path = cfg.uuid;
   // 筛选含 IPv6 时刷新官方 v6 网段（ips-v6，6 小时缓存节流；失败沿用内置/上次成功段）
+  // v6Wanted=false（未勾 IPv6，或勾了但策略为 'off'）时不必刷新——生成阶段不产出 v6 节点
   const _ipT0 = (cfg.filter && cfg.filter.ipType) || [];
-  if (_ipT0.includes('IPv6')) await refreshOfficialV6CIDRs();
+  if (v6Wanted(cfg)) await refreshOfficialV6CIDRs();
   // 首次初始化：preferredIPs 太少时同步拉取多源补充（部署即有 300+ 节点，不等 cron）
   // 关键：relay IP（第三方 VPS）做 TCP 测活过滤，踢掉死节点；CF 段 IP 也做 TCP 测活（GFW 封段剔除）
   // 失败不阻塞订阅响应
@@ -3951,11 +4127,12 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo, env) {
   //   custom          → 使用「优选节点」框内地址（支持汇聚，可增删）
   //   random          → 由 buildNodes 直接随机生成，此处不解析
   let resolved = [];
-  // 筛选含 IPv6 时查询 AAAA 记录并生成 IPv6 节点（默认双选 IPv4+IPv6 同样生效）；
+  // 筛选含 IPv6 时查询 AAAA 记录并生成 IPv6 节点；
+  // 但 v6Wanted 为 false 时不生成 v6（未勾选，或勾了但 ipv6Mode='off' —— 生成后也会被策略剔除，白耗 CPU）；
   // 仅勾选 IPv6（单选）时随机生成/补足全部走 IPv6 专用段
   const ipT = (cfg.filter && cfg.filter.ipType) || [];
-  const wantV6 = ipT.includes('IPv6');
   const onlyV6 = ipT.length === 1 && ipT[0] === 'IPv6';
+  const wantV6 = v6Wanted(cfg);
   const RAND_CIDRS = onlyV6 ? OFFICIAL_V6_CIDRS : (wantV6 ? [...REACHABLE_CIDRS, ...OFFICIAL_V6_CIDRS] : REACHABLE_CIDRS);
   // 内置 Cloudflare 优选 IP（实测可达的 Anycast 兜底池，始终随订阅下发；无明确地区，名称统一“优选IP-XX”）
   const builtinIPs = parseIPList(BUILTIN_PREFERRED_IPS.join('\n')).map(x => ({ ip: x.ip, port: x.port || 443, name: x.name || ('优选IP-' + String(BUILTIN_PREFERRED_IPS.indexOf(x) + 1).padStart(2, '0')) }));
@@ -4128,6 +4305,10 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo, env) {
   } else {
     nodes = filterNodes(await buildNodes(rc, cap, skipSet), fl);
   }
+  // ★ 清单质量第一道闸：IPv4/IPv6 策略（必须在这里——早于后面追加的兜底/保底节点，
+  //   也早于封顶截断：v6 备胎不该占用保底位，更不该在 cap 争抢中挤掉 v4）
+  // hwOnlyMode（订阅只含家宽 + 隧道前置）不走 IP 类型策略，避免影响家宽语义
+  if (!hwOnlyMode) nodes = applyIpv6Policy(nodes, cfg, onlyV6);
   // 兜底入口节点：自定义订阅严格模式（仅下发框内节点）不追加，其余模式追加原生地址与地区反代入口；
   // 仅勾选 IPv6 时跳过（原生地址/反代均为 IPv4 域名，混入会破坏「只下发 IPv6」语义）
   const strictCustom = (mode === 'custom' && !(cfg.optimizer && cfg.optimizer.subIncludeDefault));
@@ -4136,7 +4317,8 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo, env) {
   // 保证订阅内始终有稳定可用节点；仅勾选 IPv6 时跳过（保底池为 IPv4）
   // 内置保底节点：严格自定义模式（仅自定义节点）且已有自定义节点时跳过——用户自担可用性，不混入「内置·保底-X」；
   // 严格模式解析结果为空时仍追加保底，保证订阅永不为空（客户端不会收到「无效订阅」）
-  if (!hwOnlyMode && cfg.probeAlive && !onlyV6 && !(strictCustom && nodes.length > 0)) appendStableNodes(nodes, rc, cap);  // 测活关闭（1.0.6）不追加「内置·保底」节点
+  // force=true：清单已达 cap（如 nodeLimitCount 精确控制到 500）时仍追加，交由后面的「保底前置 + 封顶截断」取舍
+  if (!hwOnlyMode && cfg.probeAlive && !onlyV6 && !(strictCustom && nodes.length > 0)) appendStableNodes(nodes, rc, cap, true);  // 测活关闭（1.0.6）不追加「内置·保底」节点
   // 下发控制开启时按 cap 补足（全局生效，与轮询状态无关）：优先用 bestcf 区域优选池（实时测速过的优质 IP）补齐，
   // 不足再用 ProxyIP 域名兜底（TCP 测活通过才下发），最后才回退 CF CIDR 随机生成——
   // 避免下发大量「延迟 -1」的随机 IP 死节点（订阅场景不生成随机 IP）
@@ -4176,18 +4358,17 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo, env) {
       }
     }
   }
+  // ★ 清单质量第二道闸：IPv6 策略兜底复核（补足块 / 自定义优选池里可能混入 v6 字面地址；
+  //   ipv6Mode='off' 时生成阶段已不产出 v6，此调用是廉价保险，正常为 no-op）
+  if (!hwOnlyMode) nodes = applyIpv6Policy(nodes, cfg, onlyV6);
   // 严格封顶：多协议膨胀可能越过 cap 一个 IP（3 条），统一截断到上限；节点数量控制开启时同样按设定值精确截断
+  //
+  // ★ 顺序必须先「保底前置 + 分组乱序」再截断：
+  //   旧顺序是「先截断、后全量乱序」——保底节点（优选IP-Sxx / 内置·保底-XX）追加在列表尾部，
+  //   清单拉满到上限时按顺序截断恰好把它们全砍掉；即便没被砍，全量乱序也让它们和随机快照 IP 混在一起，
+  //   客户端「取第一个」取不到最稳的那条。改为先重排（保底组提到头部）再截断，被砍的就是尾部随机节点。
+  reorderForDelivery(nodes, cfg, mode);
   if (nodes.length > cap) nodes.length = cap;
-  // 负载均衡（面板「下发控制」可关，默认开启）：对最终节点列表做 Fisher-Yates 随机轮换——
-  // 只打乱下发顺序、不改变节点集合与可用性；客户端（自动择优/优先取头部）随刷新落在不同节点，
-  // 连接在整批节点间分散，避免所有客户端集中踩同一批头部「最优 IP」导致拥塞、全体变慢；
-  // 随机优选模式本身即随机生成（跳过），轮询去重（KV issued 按 IP 集合记录）与顺序无关
-  if (cfg.loadBalance !== false && nodes.length > 1 && mode !== 'random') {
-    for (let i = nodes.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      const t = nodes[i]; nodes[i] = nodes[j]; nodes[j] = t;
-    }
-  }
   // 收集本次下发的所有 IP 型节点地址（排除域名），记录到 KV issued 供下次去重
   const issuedIPs = [];
   const seenIssued = new Set();
@@ -4527,7 +4708,15 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
             <div class="filter-group-title">IP 类型</div>
             <div class="pills">
               <label class="spill"><input type="checkbox" id="fl-ip4" checked><span>IPv4</span></label>
-              <label class="spill"><input type="checkbox" id="fl-ip6" checked><span>IPv6</span></label>
+              <label class="spill"><input type="checkbox" id="fl-ip6"><span>IPv6</span></label>
+            </div>
+          </div>
+          <div class="filter-group">
+            <div class="filter-group-title">IPv6 下发</div>
+            <div class="pills nowrap">
+              <label class="spill"><input type="radio" name="ip6mode" id="ip6-off" value="off" checked><span>不下发</span></label>
+              <label class="spill"><input type="radio" name="ip6mode" id="ip6-tail" value="tail"><span>仅备胎</span></label>
+              <label class="spill"><input type="radio" name="ip6mode" id="ip6-full" value="full"><span>等权混合</span></label>
             </div>
           </div>
           <div class="filter-group">
@@ -4549,7 +4738,8 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
             </div>
           </div>
         </div>
-        <p class="hint" style="margin-top:12px">「节点地区」多选过滤地区；「运营商偏好」按节点名称中的运营商标记过滤（移动/联通/电信），无标记时不生效；「地址来源」控制下发来源（原生地址/优选域名/优选 IP/自定义优选/随机优选）。任一维度无节点时自动放宽，保证订阅非空。</p>
+        <p class="hint" style="margin-top:12px">「节点地区」多选过滤地区；「运营商偏好」按节点名称中的运营商标记过滤（移动/联通/电信），无标记时不生效；「地址来源」控制下发来源（原生地址/优选域名/优选 IP/自定义优选/随机优选）。任一维度无节点时自动放宽，保证订阅非空。<br>
+          <b>IPv6 下发</b>（清单质量）：IPv6 到 CF 的可达性取决于客户端所在网络，不少家庭宽带 v6 到 CF 的路径比 v4 差甚至不通，IPv6 节点在客户端逐节点测延迟时会被大量超时项拖长。<b>「不下发」为默认</b>——即使勾选了「IPv6」也不进清单；「仅备胎」= 占比封顶 10% 且整体排到列表尾部，IPv4 打头；「等权混合」= 旧行为。仅勾选 IPv6（单选）时策略自动让位，保证订阅不为空。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>配额速览 <span class="sub" id="dbSub">未配置监控</span></h3>
@@ -4602,7 +4792,9 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
         <div class="card">
           <h3><span class="tick"></span>负载均衡</h3>
           <div class="proto-row"><label class="switch"><input type="checkbox" id="q-lb-on"><span class="sl"></span></label><span>负载均衡（打乱下发顺序）</span></div>
-          <p class="hint" style="margin-top:12px">每次订阅对节点顺序随机轮换（Fisher-Yates），连接分散避免集中踩同一批头部 IP；关闭则固定顺序。</p>
+          <p class="hint" style="margin-top:12px">每次订阅对节点顺序随机轮换（Fisher-Yates），连接分散避免集中踩同一批头部 IP；关闭则固定顺序。<br>
+            <b>保底前置</b>：「优选IP-Sxx」（实测高存活 IP）/「内置·保底-XX」/「隧道前置-XX」始终保留在清单头部（组内仍随机轮换），
+            其余节点整体乱序——既保证客户端「取第一个」就是稳定节点，又不牺牲分散连接的收益；同时避免这批最稳的节点在节点数封顶时被尾部截断砍掉。</p>
         </div>
       </div>
       <div class="card">
@@ -4759,7 +4951,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
         <h3><span class="tick"></span>当前下发策略</h3>
         <div class="grid3">
           <div class="field" style="margin:0"><div class="kv"><span class="k">节点数量控制</span><span class="v" id="qNl">—</span></div><div class="kv"><span class="k">精确节点上限</span><span class="v" id="qNlCount">—</span></div></div>
-          <div class="field" style="margin:0"><div class="kv"><span class="k">节点测活</span><span class="v" id="qProbe">—</span></div><div class="kv"><span class="k">轮询换新机制</span><span class="v" id="qPoll">—</span></div><div class="kv"><span class="k">负载均衡</span><span class="v" id="qLb">—</span></div></div>
+          <div class="field" style="margin:0"><div class="kv"><span class="k">节点测活</span><span class="v" id="qProbe">—</span></div><div class="kv"><span class="k">轮询换新机制</span><span class="v" id="qPoll">—</span></div><div class="kv"><span class="k">负载均衡</span><span class="v" id="qLb">—</span></div><div class="kv"><span class="k">IPv6 下发</span><span class="v" id="qIp6">—</span></div></div>
           <div class="field" style="margin:0"><div class="kv"><span class="k">行式格式上限</span><span class="v">800 节点</span></div><div class="kv"><span class="k">结构化格式上限</span><span class="v">300 节点</span></div></div>
         </div>
         <p class="hint" style="margin-top:10px">每次订阅请求消耗 Worker CPU（免费计划 10ms/请求）。面板按「免费额度 → 格式 → 节点数」逐层设防。</p>
@@ -5130,6 +5322,10 @@ function renderQuota(){
   var lb = !(CFG && CFG.loadBalance === false);
   $('qLb').textContent = lb ? '已开启（随机轮换）' : '关闭（固定顺序）';
   $('qLb').className = 'v ' + (lb ? 'ok' : 'ok');
+  // IPv6 下发策略：'full'（旧行为）标黄提醒——v6 备胎会拖慢客户端逐节点测延迟
+  var i6 = (CFG && CFG.ipv6Mode) || 'off';
+  $('qIp6').textContent = i6 === 'full' ? '等权混合（旧行为）' : (i6 === 'tail' ? '仅备胎（≤10%，排尾部）' : '不下发');
+  $('qIp6').className = 'v ' + (i6 === 'full' ? 'warn' : 'ok');
 }
 function fmtNum(n){
   if (n == null || isNaN(n)) return '—';
@@ -5241,9 +5437,13 @@ function fillForm(){
   var regionArr = Array.isArray(region) ? region : (region === 'all' ? ['all'] : [region]);
   $('fl-region-all').checked = regionArr.indexOf('all') >= 0;
   ['HK', 'TW', 'US', 'SG', 'JP', 'KR', 'DE'].forEach(function(r){ $('fl-region-' + r).checked = regionArr.indexOf(r) >= 0; });
-  var ipType = fl.ipType || ['IPv4', 'IPv6'];
+  var ipType = fl.ipType || ['IPv4'];
   $('fl-ip4').checked = ipType.indexOf('IPv4') >= 0;
   $('fl-ip6').checked = ipType.indexOf('IPv6') >= 0;
+  var ip6 = CFG.ipv6Mode || 'off';
+  $('ip6-off').checked = ip6 !== 'tail' && ip6 !== 'full';
+  $('ip6-tail').checked = ip6 === 'tail';
+  $('ip6-full').checked = ip6 === 'full';
   var isp = fl.isp || ['移动', '联通', '电信'];
   $('fl-isp-m').checked = isp.indexOf('移动') >= 0;
   $('fl-isp-c').checked = isp.indexOf('联通') >= 0;
@@ -5333,6 +5533,7 @@ function collectForm(){
     nodeLimitCount: parseInt($('q-nl-count').value) || 500,
     polling: $('q-poll-on').checked,
     loadBalance: $('q-lb-on').checked,
+    ipv6Mode: $('ip6-tail').checked ? 'tail' : ($('ip6-full').checked ? 'full' : 'off'),
     probeAlive: $('q-probe-on').checked,
     cfAccountId: $('a-cfid').value.trim(),
     cfApiToken: $('a-cftoken').value.trim(),
